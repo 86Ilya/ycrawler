@@ -6,7 +6,7 @@ import aiohttp
 import aiofiles
 import async_timeout
 from aiohttp.client_exceptions import ClientConnectionError, ServerDisconnectedError
-from asyncio import TimeoutError
+from asyncio import TimeoutError, CancelledError
 # other modules
 import argparse
 import logging
@@ -16,6 +16,9 @@ import os
 import html
 import hashlib
 import time
+import uuid
+from collections import defaultdict
+
 
 LOGGER_FORMAT = '[%(asctime)s] %(levelname).1s %(message)s'
 DATE_FORMAT = '%Y.%m.%d %H:%M:%S'
@@ -38,7 +41,7 @@ class CrawlerError(Exception):
     pass
 
 
-class Getter:
+class Fetcher:
     """
     Класс обёртка для функции скачивания. Позволяет сохранять ошибки и
     имена скачанных страниц.
@@ -49,8 +52,16 @@ class Getter:
         self.error = "something wrong"
         self.downloaded_pages = list()
         self.black_list = list()
+        # Переменная для подсчёта скачанных страниц отдельно для каждой итерации
+        self.jobs = defaultdict(int)
 
-    async def fetch(self, url):
+    def increment_job_count(self, job_id):
+        self.jobs[job_id] += 1
+
+    def get_downloaded_pages_by_job_id(self, job_id):
+        return self.jobs.pop(job_id)
+
+    async def fetch(self, url, job_id):
         """
         Простой метод для скачивания ресурсов.
         :param self:
@@ -61,40 +72,41 @@ class Getter:
             with async_timeout.timeout(FETCH_TIMEOUT):
                 try:
                     async with self.session.get(url, ssl=SSLCONTEXT) as response:
-                        if 'text/html' in response.headers['Content-Type']:
+                        header = response.headers.get('Content-Type', None)
+                        if header and 'text/html' in header:
                             page = await response.text()
-                            # Если успешно скачали страницу, то добавим её в список скачанных
-                            # Тут будет и заглавная страница и страницы по сслыкам из комментариев
-                            self.downloaded_pages.append(url)
-                            return page
                         else:
-                            # same
-                            self.downloaded_pages.append(url)
                             page = await response.read()
-                            return page
+                        # Если успешно скачали страницу, то добавим её в список скачанных
+                        # Тут будет и заглавная страница и страницы по сслыкам из комментариев
+                        self.downloaded_pages.append(url)
+                        self.increment_job_count(job_id)
+                        return page
                 except (ClientConnectionError, ServerDisconnectedError,
                         TimeoutError, UnicodeDecodeError) as error:
                     self.error = str(error)
+                except CancelledError as error:
+                    self.error = "Cancelled Task"
 
-        #  Если мы дошли до этого места, значит имело место быть ошибка.
-        #  Запишем её. Обработка возвращаемого None производится уже на уровне выше.
+        # Если мы дошли до этого места, значит имело место быть ошибка.
+        # Запишем её. Обработка возвращаемого None производится уже на уровне выше.
         logging.error(self.error)
         self.errors.update({url: self.error})
         # Заодно добавим страницу в "чёрный список", чтобы не зацикливаться на её скачивании
         self.black_list.append(url)
 
 
-async def get_top_urls(getter, base_url):
+async def get_top_urls(fetcher, base_url, job_id):
     """
     Функция получает на вход базовый url новостного сайта. Парсит его на новостные
     ссылки и возвращает массив со ссылками на новости и id для генерации ссылки комментарии
     к соответствующей новости.
-    :param Getter getter:
+    :param Fetcher fetcher:
     :param string base_url:
     :return list: [(id_comment1, url1), (id_comment2, url2)...]
     """
 
-    response = await getter.fetch(base_url)
+    response = await fetcher.fetch(base_url, job_id)
     if response is None:
         error = "Ошибка подключения к сайту новостей"
         raise CrawlerError(error)
@@ -102,31 +114,31 @@ async def get_top_urls(getter, base_url):
     return [(m.group(1), m.group(2)) for m in search_result]
 
 
-async def download_page_with_comments(getter, root, url, comments_id):
+async def download_page_with_comments(fetcher, job_id, root, url, comments_id):
     """
     Функция скачивает страницу и все страницы по ссылкам в комментариях.
-    :param Getter getter:
+    :param Fetcher fetcher:
     :param string root:
     :param string url:
     :param string comments_id:
     :return None:
     """
     tasks = list()
-    page = getter.fetch(url)
+    page = fetcher.fetch(url, job_id)
     tasks.append(save_page(page, root, url, url))
-    comments_page = await getter.fetch(COMMENTS_URL.format(comments_id))
+    comments_page = await fetcher.fetch(COMMENTS_URL.format(comments_id), job_id)
     if comments_page is None:
         return
     # TODO 1 regex!!!
     comments = REGEX_COMMENTSPAN.finditer(comments_page)
-    if comments:
-        for comment in comments:
-            for link in REGEX_HREF.finditer(comment.group(1)):
-                if link:
-                    link = html.unescape(link.group(1))
-                    task = save_page(getter.fetch(link), root, url, link)
-                    tasks.append(task)
-    await asyncio.ensure_future(asyncio.gather(*tasks))
+    for comment in comments:
+        for link in REGEX_HREF.finditer(comment.group(1)):
+            if link:
+                link = html.unescape(link.group(1))
+                task = save_page(fetcher.fetch(link, job_id), root, url, link)
+                tasks.append(asyncio.create_task(task))
+
+    await asyncio.gather(*tasks)
 
 
 def create_folder(root, foldername):
@@ -196,28 +208,31 @@ async def main(args):
     :param args:
     :return None:
     """
-    async with aiohttp.ClientSession(loop=loop) as session:
-        getter = Getter(session)
+    async with aiohttp.ClientSession() as session:
+        fetcher = Fetcher(session)
         while True:
             try:
-                logging.info("Начинаем скачивание страниц")
-                last_fetched_num = len(getter.downloaded_pages)
-                top_urls = await get_top_urls(getter, BASE_URL)
-                tasks = list()
-                for comment_id, url in top_urls:
-                    if 'item?id=' in url:
-                        url = BASE_URL+url
-                    url = url.strip()
-                    if url not in getter.downloaded_pages and url not in getter.black_list:
-                        tasks.append(download_page_with_comments(getter, args.root, url, comment_id))
-                await asyncio.gather(*tasks)
-                cur_fetched_num = len(getter.downloaded_pages)
-
-                logging.info("Было скачано {} ресурсов".format(cur_fetched_num - last_fetched_num))
-                logging.info("Закончили скачивание страниц")
+                async def one_iteration():
+                    job_id = uuid.uuid1()
+                    logging.info("Начинаем скачивание страниц")
+                    last_fetched_num = len(fetcher.downloaded_pages)
+                    top_urls = await get_top_urls(fetcher, BASE_URL, job_id)
+                    tasks = list()
+                    for comment_id, url in top_urls:
+                        if 'item?id=' in url:
+                            url = BASE_URL + url
+                        url = url.strip()
+                        if url not in fetcher.downloaded_pages and url not in fetcher.black_list:
+                            tasks.append(download_page_with_comments(fetcher, job_id, args.root, url, comment_id))
+                    await asyncio.gather(*tasks)
+                    downloaded_pages = fetcher.get_downloaded_pages_by_job_id(job_id)
+                    logging.info("Было скачано {} ресурсов".format(downloaded_pages))
+                    logging.info("Закончили скачивание страниц")
+                # Запустим независимо одну итерацию по скачиванию страниц
+                asyncio.create_task(one_iteration())
                 await asyncio.sleep(args.period)
             finally:
-                for url, error in getter.errors.items():
+                for url, error in fetcher.errors.items():
                     print("URL ERROR: {}, MESSAGE: {}".format(url, error))
 
 
@@ -241,11 +256,7 @@ if __name__ == '__main__':
     if args.verbose:
         log.setLevel(logging.DEBUG)
     os.makedirs(args.root, exist_ok=True)
-    loop = asyncio.get_event_loop()
     try:
-        loop.run_until_complete(main(args))
+        asyncio.run(main(args))
     except Exception as error:
         logging.exception(str(error))
-    finally:
-        loop.stop()
-        loop.close()
